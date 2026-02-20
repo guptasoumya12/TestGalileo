@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from langgraph.graph import END, StateGraph
@@ -27,10 +29,11 @@ except ImportError:
 # Module-level holder shared across all nodes during a single run.
 _observe_workflows: Optional[Any] = None
 _galileo_init_done = False
+_galileo_lock = threading.Lock()  # serialise Galileo API access
 
 
 def _init_galileo() -> Optional[Any]:
-    """Initialise the ObserveWorkflows tracker (singleton per run).
+    """Initialise the ObserveWorkflows tracker (singleton per process).
 
     Returns the ObserveWorkflows instance or None if unavailable.
     """
@@ -62,70 +65,137 @@ def _init_galileo() -> Optional[Any]:
     return _observe_workflows
 
 
-def _start_galileo_workflow(input_summary: str) -> None:
-    """Begin a new top-level agent workflow in Galileo."""
+# ── Thread-local step collector ─────────────────────────────────────
+# Each thread accumulates steps in its own buffer during pipeline
+# execution.  Once the pipeline finishes, the entire workflow
+# (start → steps → conclude) is replayed into the Galileo API under
+# a single lock – guaranteeing no interleaving between threads.
+
+
+@dataclass
+class _StepRecord:
+    node_name: str
+    input_text: str
+    output_text: str
+    duration_ns: int
+    status_code: int = 200  # 200 = ok, 500 = error
+
+
+_thread_local = threading.local()
+
+
+def _get_step_buffer() -> list[_StepRecord]:
+    """Return the step buffer for the current thread (create if needed)."""
+    if not hasattr(_thread_local, "steps"):
+        _thread_local.steps = []
+    return _thread_local.steps
+
+
+def _collect_step(
+    node_name: str,
+    input_text: str,
+    output_text: str,
+    duration_ns: int,
+    *,
+    status_code: int = 200,
+) -> None:
+    """Buffer a step record (thread-local, no lock needed)."""
+    buf = _get_step_buffer()
+    buf.append(_StepRecord(node_name, input_text, output_text, duration_ns, status_code))
+    duration_ms = duration_ns / 1_000_000
+    tag = "ERROR" if status_code >= 400 else "OK"
+    print(f"  📝 [Collected] step: {node_name} ({duration_ms:.0f}ms) [{tag}]")
+
+
+def _replay_workflow_to_galileo(
+    input_summary: str,
+    output_summary: str,
+    total_duration_ns: int,
+    *,
+    workflow_status_code: int = 200,
+) -> None:
+    """Replay all collected steps as a single Galileo workflow (atomic).
+
+    Args:
+        workflow_status_code: HTTP-style status for the overall workflow.
+            200 = success, 500 = pipeline crashed.
+    """
     ow = _init_galileo()
     if ow is None:
         return
-    try:
-        ow.add_agent_workflow(
-            input=input_summary,
-            name="image-enhancement-pipeline",
-            metadata={"framework": "langgraph"},
-        )
-        print("\n📤 [Galileo] Started workflow: image-enhancement-pipeline")
-        print(f"   Input: {input_summary[:200]}{'...' if len(input_summary) > 200 else ''}")
-    except Exception as exc:
-        print(f"⚠️  Galileo: failed to start workflow – {exc}")
+
+    steps = _get_step_buffer()
+    has_errors = any(s.status_code >= 400 for s in steps)
+    wf_code = workflow_status_code if workflow_status_code >= 400 else (500 if has_errors else 200)
+
+    with _galileo_lock:
+        try:
+            # 1. Start workflow
+            ow.add_agent_workflow(
+                input=input_summary,
+                name="image-enhancement-pipeline",
+                metadata={
+                    "framework": "langgraph",
+                    "has_errors": str(has_errors),
+                    "workflow_status": str(wf_code),
+                },
+            )
+            # 2. Replay every step (with per-step status codes)
+            for step in steps:
+                ow.add_tool_step(
+                    input=step.input_text,
+                    output=step.output_text,
+                    name=step.node_name,
+                    duration_ns=step.duration_ns,
+                    status_code=step.status_code,
+                    metadata={
+                        "node": step.node_name,
+                        "status": "error" if step.status_code >= 400 else "ok",
+                    },
+                )
+            # 3. Conclude
+            ow.conclude_workflow(
+                output=output_summary,
+                duration_ns=total_duration_ns,
+                status_code=wf_code,
+            )
+            total_ms = total_duration_ns / 1_000_000
+            status_tag = "❌ ERROR" if wf_code >= 400 else "✅ OK"
+            print(f"  📤 [Galileo] Replayed workflow ({len(steps)} steps, {total_ms:.0f}ms) [{status_tag}]")
+        except Exception as exc:
+            print(f"  ⚠️  Galileo: failed to replay workflow – {exc}")
+
+    # Clear the buffer for this thread
+    steps.clear()
 
 
-def _log_galileo_step(node_name: str, input_text: str, output_text: str, duration_ns: int) -> None:
-    """Log a single tool step inside the current Galileo workflow."""
+def flush_galileo() -> int:
+    """Upload all accumulated workflows to Galileo. Returns count uploaded."""
     ow = _init_galileo()
     if ow is None:
-        return
-    try:
-        ow.add_tool_step(
-            input=input_text,
-            output=output_text,
-            name=node_name,
-            duration_ns=duration_ns,
-            status_code=200,
-            metadata={"node": node_name},
-        )
-        duration_ms = duration_ns / 1_000_000
-        print(f"\n📤 [Galileo] Logged step: {node_name} ({duration_ms:.0f}ms)")
-        print(f"   Input:  {input_text[:150]}{'...' if len(input_text) > 150 else ''}")
-        print(f"   Output: {output_text[:150]}{'...' if len(output_text) > 150 else ''}")
-    except Exception as exc:
-        print(f"⚠️  Galileo: failed to log step '{node_name}' – {exc}")
+        return 0
+    with _galileo_lock:
+        try:
+            print(f"📤 [Galileo] Uploading workflows to Galileo...")
+            results = ow.upload_workflows()
+            print(f"✅ Galileo: uploaded {len(results)} workflow(s) successfully.")
+            return len(results)
+        except Exception as exc:
+            print(f"⚠️  Galileo: failed to upload workflows – {exc}")
+            return 0
 
 
-def _conclude_and_upload(output_summary: str, duration_ns: int) -> None:
-    """Conclude the Galileo workflow and upload all recorded data."""
-    ow = _init_galileo()
-    if ow is None:
-        return
-    try:
-        duration_ms = duration_ns / 1_000_000
-        ow.conclude_workflow(
-            output=output_summary,
-            duration_ns=duration_ns,
-            status_code=200,
-        )
-        print(f"\n📤 [Galileo] Concluded workflow (total {duration_ms:.0f}ms)")
-        print(f"   Output: {output_summary[:200]}{'...' if len(output_summary) > 200 else ''}")
-        print(f"📤 [Galileo] Uploading workflows to Galileo...")
-        results = ow.upload_workflows()
-        print(f"✅ Galileo: uploaded {len(results)} workflow(s) successfully.")
-    except Exception as exc:
-        print(f"⚠️  Galileo: failed to upload workflows – {exc}")
+def reset_galileo() -> None:
+    """Reset the Galileo singleton so a fresh ObserveWorkflows is created."""
+    global _observe_workflows, _galileo_init_done  # noqa: PLW0603
+    _observe_workflows = None
+    _galileo_init_done = False
 
 
 # ── Galileo-instrumented wrapper helpers ────────────────────────────
 
 def _observed(node_name: str, fn):
-    """Wrap a LangGraph node function with Galileo step logging."""
+    """Wrap a LangGraph node function with step collection."""
 
     def wrapper(state: ImagePipelineState) -> dict:
         input_summary = json.dumps(
@@ -137,14 +207,19 @@ def _observed(node_name: str, fn):
         try:
             result = fn(state)
         except Exception as exc:
-            # Log error step to Galileo if possible
             duration_ns = time.time_ns() - start_ns
-            _log_galileo_step(node_name, input_summary, f"ERROR: {exc}", duration_ns)
+            _collect_step(
+                node_name,
+                input_summary,
+                f"ERROR: {type(exc).__name__}: {exc}",
+                duration_ns,
+                status_code=500,
+            )
             raise
 
         duration_ns = time.time_ns() - start_ns
         output_summary = json.dumps(result, default=str)
-        _log_galileo_step(node_name, input_summary, output_summary, duration_ns)
+        _collect_step(node_name, input_summary, output_summary, duration_ns)
         return result
 
     wrapper.__name__ = node_name
@@ -198,30 +273,61 @@ def build_workflow() -> StateGraph:
     return graph.compile()
 
 
-def run_pipeline(initial_state: ImagePipelineState) -> ImagePipelineState:
+def run_pipeline(
+    initial_state: ImagePipelineState,
+    *,
+    defer_upload: bool = False,
+    raise_on_error: bool = True,
+) -> ImagePipelineState:
     """Build the graph, run it, and handle Galileo workflow lifecycle.
 
+    Args:
+        initial_state: The initial pipeline state dict.
+        defer_upload: If True, replay steps into Galileo but do NOT upload
+                      yet.  Call ``flush_galileo()`` later to push all
+                      accumulated workflows in one batch.
+        raise_on_error: If False, catch pipeline exceptions and return the
+                        last known state (useful for anomaly testing).
+
     This is the recommended entry-point – it ensures the Galileo workflow
-    is properly started, concluded, and uploaded.
+    is properly started, concluded, and (optionally) uploaded even on errors.
     """
+    # Clear any leftover step buffer for this thread
+    _get_step_buffer().clear()
+
     app = build_workflow()
 
-    # Open the Galileo workflow
     input_summary = json.dumps(
         {k: v for k, v in initial_state.items() if k != "enhancement_log"},
         default=str,
     )
-    _start_galileo_workflow(input_summary)
 
+    pipeline_error: Optional[Exception] = None
     pipeline_start = time.time_ns()
-    final_state = app.invoke(initial_state)
+    try:
+        final_state = app.invoke(initial_state)
+    except Exception as exc:
+        pipeline_error = exc
+        final_state = dict(initial_state)
+        final_state["status"] = f"PIPELINE_ERROR: {type(exc).__name__}: {exc}"
     pipeline_duration = time.time_ns() - pipeline_start
 
-    # Close & upload
     output_summary = json.dumps(
         {k: v for k, v in final_state.items() if k != "enhancement_log"},
         default=str,
     )
-    _conclude_and_upload(output_summary, pipeline_duration)
+
+    # Replay the entire workflow into Galileo atomically
+    wf_status = 500 if pipeline_error else 200
+    _replay_workflow_to_galileo(
+        input_summary, output_summary, pipeline_duration,
+        workflow_status_code=wf_status,
+    )
+
+    if not defer_upload:
+        flush_galileo()
+
+    if pipeline_error and raise_on_error:
+        raise pipeline_error
 
     return final_state
